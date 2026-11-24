@@ -26,7 +26,7 @@ FIELDS = {"id": str, "family": str, "trap": bool, "prompt": str}
 
 
 def check(tid: str, pages: tools.Pages) -> list[str]:
-    task, d = ae.load_task(tid), ae.TASKS / tid
+    task, d = ae.load_task(tid), ae.task_dir(tid)[1]
     errs = [f"field {k}: not a {t.__name__}" for k, t in FIELDS.items() if not isinstance(task.get(k), t)]
     if errs:
         return errs

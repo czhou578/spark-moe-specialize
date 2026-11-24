@@ -64,7 +64,7 @@ def env(tmp_path, monkeypatch):
     (tmp_path / "data" / "repo").mkdir(parents=True)
     (tmp_path / "data" / "notes.txt").write_text("a note\n")
     (tmp_path / "data" / "repo" / "x.py").write_text("print(1)\n" * 300)
-    for name, value in [("TASKS", tmp_path / "tasks"), ("DATA", tmp_path / "data"), ("OUT", tmp_path / "out"),
+    for name, value in [("SETS", {"dev": tmp_path / "tasks"}), ("DATA", tmp_path / "data"), ("OUT", tmp_path / "out"),
                         ("MEM", tmp_path / "mem.log")]:
         monkeypatch.setattr(ae, name, value)
     return tmp_path
@@ -196,3 +196,31 @@ def test_extra_body(env, monkeypatch):
     row = ae.run_task(ae.load_task("L1"), "stub-high", 0, 0, env / "run", ae.tools.Pages(None))
     assert row["model"] == "stub-high" and stub.bodies[0]["chat_template_kwargs"] == {"reasoning_effort": "high"}
     assert "chat_template_kwargs" not in ae.MODELS["deepseek"][4:]
+
+
+def test_task_sets(env, monkeypatch):
+    assert ae.task_sets("dev=/a/b:/c/heldout") == {"dev": ae.Path("/a/b"), "heldout": ae.Path("/c/heldout")}
+    held = env / "held"
+    ae.shutil.copytree(env / "tasks" / "L1", held / "H1")
+    (held / "H1" / "task.json").write_text((held / "H1" / "task.json").read_text().replace('"L1"', '"H1"'))
+    monkeypatch.setitem(ae.SETS, "heldout", held)
+    assert ae.all_tasks() == ["H1", "L1", "L2"] and ae.load_task("H1")["set"] == "heldout"
+    use(monkeypatch, [reply(REPORT)])
+    assert run(env, "H1")["set"] == "heldout"
+    ae.shutil.copytree(env / "tasks" / "L2", held / "L2")
+    with pytest.raises(ValueError, match="L2"):
+        ae.all_tasks()
+
+
+def test_endpoint(env, monkeypatch, capsys):
+    monkeypatch.setattr(ae, "MODELS", dict(ae.MODELS))
+    stub = Stub([reply(REPORT)])
+    monkeypatch.setattr("sys.argv", ["agent_eval.py", "run", "--task", "L1", "--model", "m1", "--endpoint", "m1",
+                                     stub.url + "/v1/", "served-m1", "--max-tokens", "50", "--time-limit", "60"])
+    ae.main()
+    assert json.loads(capsys.readouterr().out)["result"] == "pass"
+    assert stub.bodies[0]["model"] == "served-m1" and stub.bodies[0]["max_tokens"] == 50
+    assert ae.MODELS["m1"] == (stub.url, "served-m1", 50, 60)
+    monkeypatch.setattr("sys.argv", ["agent_eval.py", "point", "--name", "x", "--mix", "nobody=1"])
+    with pytest.raises(SystemExit):
+        ae.main()

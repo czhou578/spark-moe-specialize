@@ -66,3 +66,18 @@ def test_other_model_names(out):
     out("D1", [row(f"L{i}", 0, "pass", model="deepseek") for i in range(1, 5)])
     out("D1h", [row(f"L{i}", 0, "wrong" if i == 1 else "pass", model="deepseek-high") for i in range(1, 5)])
     assert "| deepseek-high vs deepseek | +0.0 (" in rep.table("D1h", "D1") and "| -25.0 (" in rep.table("D1h", "D1")
+
+
+def test_json_report(out, tmp_path):
+    out("P1", [row("L1", s, "pass") | {"set": "heldout", "stop": "report"} for s in range(2)]
+        + [row("L2", 0, "wrong"), row("L3", 0, "pass")])
+    (tmp_path / "P1" / "qwen-L1-s0").mkdir()
+    turns = [{"usage": {"prompt_tokens": p}} for p in (150, 250, 330)]
+    (tmp_path / "P1" / "qwen-L1-s0" / "transcript.json").write_text(json.dumps({"turns": turns}))
+    r = rep.report("P1", block=100)
+    g = {(x["set"], x["family"]): x for x in r["groups"]}
+    assert set(g) == {("all", "all"), ("all", "L"), ("dev", "all"), ("dev", "L"), ("heldout", "all"), ("heldout", "L")}
+    assert g["heldout", "all"]["pass"] == {"rate": 100.0, "lo": 100.0, "hi": 100.0} and g["heldout", "L"]["runs"] == 2
+    a = g["all", "all"]
+    assert a["tasks"] == 3 and a["pass"]["lo"] <= round(200 / 3, 1) == a["pass"]["rate"] <= a["pass"]["hi"]
+    assert r["cache"]["qwen"] == {"block_size": 100, "prompt_tokens": 730, "best_hits": 300, "best_rate": 41.1}

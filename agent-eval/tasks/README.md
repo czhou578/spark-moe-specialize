@@ -24,6 +24,19 @@ tasks/<id>/
   solution/     the reference solution: files on top of files/ (C, D, normal tasks only)
 ```
 
+## Other task sets
+
+A task set is a folder of task folders in this format. `AGENT_EVAL_TASKS` names the sets: folders separated by `:`,
+each as `NAME=PATH`. The default is `dev=agent-eval/tasks`, this folder. A task id must be in one set only. Each row
+of a point records the set of its task, and `agent_report.py <point> --json` gives the rates for each set.
+
+A private set of held-out tasks thus stays out of this public repository:
+
+```
+AGENT_EVAL_TASKS=dev=agent-eval/tasks:heldout=$HOME/Projects/agent-eval-heldout/tasks \
+  python3 agent-eval/agent_eval.py point --name H1 --mix qwen=1 --seeds 3
+```
+
 ## The fields of task.json
 
 | Field | Families | Meaning |

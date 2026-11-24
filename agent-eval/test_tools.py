@@ -116,3 +116,11 @@ def test_slots_are_shared_by_processes(tmp_path, monkeypatch):
     p.wait(10)
     t.join(5)
     assert got in ([0], [1])
+
+
+def test_docker_cmd_limits(monkeypatch):
+    monkeypatch.setattr(sandbox, "MEMORY", "2g")
+    monkeypatch.setattr(sandbox, "CPUS", "2")
+    cmd = " ".join(sandbox.docker_cmd("/w", "ls", 5, "n"))
+    assert "--memory 2g --memory-swap 2g" in cmd and "--cpus 2" in cmd and "--network none" in cmd
+    assert "--cap-drop ALL --security-opt no-new-privileges" in cmd
