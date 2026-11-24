@@ -9,6 +9,10 @@ the runs that already have a row, so that it can continue after a stop.
   python3 agent_eval.py run --task L1 --model qwen --keep
   python3 agent_eval.py point --name Q4 --mix qwen=4 --seeds 3 --ctx 0
   python3 agent_eval.py point --name M5 --mix qwen=4,deepseek=1 --seeds 1
+  python3 agent_eval.py point --name G1 --endpoint gptoss http://127.0.0.1:8000 gpt-oss-20b --mix gptoss=8 --seeds 3
+
+--endpoint adds a model of any OpenAI-compatible server to the fixed models. AGENT_EVAL_TASKS names the task sets:
+folders separated by ":", each as NAME=PATH (default: dev=agent-eval/tasks). Each row records the set of its task.
 """
 
 import argparse
@@ -30,7 +34,6 @@ import tools
 
 AE = Path(__file__).resolve().parent
 S = Path(os.environ.get("AGENT_EVAL_S", "/home/colin-spark/Projects/dsv4-specialize"))
-TASKS = Path(os.environ.get("AGENT_EVAL_TASKS", AE / "tasks"))
 DATA = Path(os.environ.get("AGENT_EVAL_DATA", S / "results/agent-eval/data"))
 OUT = Path(os.environ.get("AGENT_EVAL_OUT", S / "results/agent-eval"))
 MEM = Path(os.environ.get("AGENT_EVAL_MEM", S / "results/pair-mem.log"))
@@ -43,6 +46,19 @@ MODELS = {   # url, served name, max_tokens per turn (Qwen: the cap of the gatew
                       {"chat_template_kwargs": {"reasoning_effort": "high"}}),
 }
 MAX_TURNS, MAX_NUDGES = 25, 3
+
+
+def task_sets(spec: str) -> dict[str, Path]:
+    """The task sets of AGENT_EVAL_TASKS: folders separated by ":", each as NAME=PATH, or as PATH with the name of the
+    folder as the name of the set."""
+    sets = {}
+    for part in filter(None, spec.split(":")):
+        name, _, path = part.rpartition("=")
+        sets[name or Path(path).name] = Path(path).expanduser()
+    return sets
+
+
+SETS = task_sets(os.environ.get("AGENT_EVAL_TASKS", f"dev={AE / 'tasks'}"))
 SYSTEM = """You are a careful software and research agent. You work in the folder /work, which holds the files of \
 the task. Use the tools to read files, search, run commands and write files. The run tool executes a bash command \
 in /work with no network access.
@@ -58,13 +74,32 @@ URL) and an exact quote copied from it.
 NUDGE = "Continue the task with a tool call. When you are finished, call the report tool."
 
 
+def task_dir(task_id: str) -> tuple[str, Path]:
+    """The set and the folder of a task."""
+    for name, d in SETS.items():
+        if (d / task_id / "task.json").is_file():
+            return name, d / task_id
+    raise FileNotFoundError(f"task {task_id} is in none of the sets {list(SETS)}")
+
+
 def load_task(task_id: str) -> dict:
-    return json.loads((TASKS / task_id / "task.json").read_text())
+    name, d = task_dir(task_id)
+    return json.loads((d / "task.json").read_text()) | {"set": name}
 
 
 def all_tasks(families: str = "") -> list[str]:
-    ids = sorted(p.parent.name for p in TASKS.glob("*/task.json"))
-    return [i for i in ids if not families or load_task(i)["family"] in families.split(",")]
+    ids = [p.parent.name for d in SETS.values() for p in d.glob("*/task.json")]
+    if dup := sorted({i for i in ids if ids.count(i) > 1}):
+        raise ValueError(f"task ids in more than one set: {dup}")
+    return [i for i in sorted(ids) if not families or load_task(i)["family"] in families.split(",")]
+
+
+def add_endpoint(name: str, url: str, served: str, max_tokens: int, time_limit: int) -> None:
+    """A model of an OpenAI-compatible server at url (with or without /v1), beside the fixed models."""
+    if name in MODELS:
+        raise ValueError(f"the model {name} exists already")
+    url = url.rstrip("/")
+    MODELS[name] = (url.removesuffix("/v1"), served, max_tokens, time_limit)
 
 
 def sha(path: Path) -> str | None:
@@ -74,7 +109,7 @@ def sha(path: Path) -> str | None:
 def workspace(task: dict, ws: Path) -> None:
     """A new workspace: the files of the task, and its data (paths under DATA) at the same relative paths."""
     shutil.rmtree(ws, ignore_errors=True)
-    files, skip = TASKS / task["id"] / "files", shutil.ignore_patterns("__pycache__", ".pytest_cache", "target")
+    files, skip = task_dir(task["id"])[1] / "files", shutil.ignore_patterns("__pycache__", ".pytest_cache", "target")
     shutil.copytree(files, ws, ignore=skip) if files.is_dir() else ws.mkdir(parents=True)
     for rel in task.get("data", []):
         src, dst = DATA / rel, ws / rel
@@ -178,15 +213,15 @@ def run_task(task: dict, model: str, seed: int, ctx: int, run_dir: Path, pages: 
     tr["protected"] = {"before": prot, "after": {p: sha(ws / p) for p in prot}}
     if task.get("check_cmd") and tr["report"] and tr["report"]["status"] == "done":
         shutil.rmtree(ws / ".hidden", ignore_errors=True)
-        shutil.copytree(TASKS / task["id"] / "hidden", ws / ".hidden")
+        shutil.copytree(task_dir(task["id"])[1] / "hidden", ws / ".hidden")
         tr["check"] = sandbox.run(str(ws), task["check_cmd"], timeout=300)
-    ev = checks.events(tr, task, [ws, TASKS / task["id"] / "files", DATA], pages)
+    ev = checks.events(tr, task, [ws, task_dir(task["id"])[1] / "files", DATA], pages)
     tr["events"], tr["result"] = ev, checks.result(tr, task, ev)
     (run_dir / "transcript.json").write_text(json.dumps(tr, indent=1))
     if not keep:
         shutil.rmtree(ws, ignore_errors=True)
     usage = [t["usage"] for t in tr["turns"]]
-    return {"task": task["id"], "family": task["family"], "trap": task["trap"], "model": model, "seed": seed,
+    return {"task": task["id"], "set": task.get("set"), "family": task["family"], "trap": task["trap"], "model": model, "seed": seed,
             "ctx": ctx, "result": tr["result"], "events": {k: len(v) for k, v in ev.items()},
             "status": (tr["report"] or {}).get("status"), "stop": tr["stop"], "turns": len(tr["turns"]),
             "check_exit": (tr.get("check") or {}).get("exit"), "seconds": tr["seconds"],
@@ -215,7 +250,7 @@ def rescore(name: str) -> int:
     for row in rows:
         d, task = out / f"{row['model']}-{row['task']}-s{row['seed']}", load_task(row["task"])
         tr = json.loads((d / "transcript.json").read_text())
-        ev = checks.events(tr, task, [d / "ws", TASKS / task["id"] / "files", DATA], pages)
+        ev = checks.events(tr, task, [d / "ws", task_dir(task["id"])[1] / "files", DATA], pages)
         tr["events"], tr["result"] = ev, checks.result(tr, task, ev)
         (d / "transcript.json").write_text(json.dumps(tr, indent=1))
         if tr["result"] != row["result"]:
@@ -264,7 +299,7 @@ def point(name: str, mix: dict[str, int], seeds: int, ctx: int, task_ids: list[s
             if (m, t, s) not in done]
     for f in futs:
         f.result()
-    meta = {"name": name, "mix": mix, "seeds": seeds, "first_seed": first_seed, "ctx": ctx, "tasks": task_ids, "start": t0, "end": time.time()}
+    meta = {"name": name, "mix": mix, "sets": {k: str(v) for k, v in SETS.items()}, "seeds": seeds, "first_seed": first_seed, "ctx": ctx, "tasks": task_ids, "start": t0, "end": time.time()}
     meta.update(lowest_memory(int(t0), int(meta["end"])))
     (out / "point.json").write_text(json.dumps(meta, indent=1))
     return out
@@ -273,13 +308,18 @@ def point(name: str, mix: dict[str, int], seeds: int, ctx: int, task_ids: list[s
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run", help="one run, for a manual check")
+    model = argparse.ArgumentParser(add_help=False)
+    model.add_argument("--endpoint", nargs=3, metavar=("NAME", "URL", "SERVED_NAME"),
+                       help="a model of an OpenAI-compatible server, beside the fixed models")
+    model.add_argument("--max-tokens", type=int, default=8192, help="max_tokens per turn of the --endpoint model")
+    model.add_argument("--time-limit", type=int, default=1200, help="the time limit per run in s of the --endpoint model")
+    r = sub.add_parser("run", parents=[model], help="one run, for a manual check")
     r.add_argument("--task", required=True)
-    r.add_argument("--model", choices=MODELS, default="qwen")
+    r.add_argument("--model", default="qwen", help=f"a fixed model ({', '.join(MODELS)}) or the NAME of --endpoint")
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--ctx", type=int, default=0, help="padding in prompt tokens")
     r.add_argument("--keep", action="store_true", help="keep the workspace")
-    p = sub.add_parser("point", help="a point: all runs with N workers per model")
+    p = sub.add_parser("point", parents=[model], help="a point: all runs with N workers per model")
     p.add_argument("--name", required=True)
     p.add_argument("--mix", required=True, help="model=workers, comma-separated, e.g. qwen=4,deepseek=1")
     p.add_argument("--seeds", type=int, default=1)
@@ -291,6 +331,11 @@ def main():
     p.add_argument("--keep", action="store_true")
     sub.add_parser("rescore", help="recompute the events of a point from its transcripts").add_argument("--name", required=True)
     a = ap.parse_args()
+    if getattr(a, "endpoint", None):
+        add_endpoint(*a.endpoint, a.max_tokens, a.time_limit)
+    unknown = {a.model} if a.cmd == "run" else {x.split("=")[0] for x in a.mix.split(",")} if a.cmd == "point" else set()
+    if unknown - MODELS.keys():
+        ap.error(f"unknown model: {', '.join(sorted(unknown - MODELS.keys()))}")
     if a.cmd == "rescore":
         print(f"{rescore(a.name)} results changed")
     elif a.cmd == "run":

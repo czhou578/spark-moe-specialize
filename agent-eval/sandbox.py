@@ -4,7 +4,8 @@ Each command runs in a new Docker container of the image ``agent-eval-sandbox:1`
 
 - no network (``--network none``), a read-only root, and a tmpfs on /tmp;
 - the workspace of the run on /work, read-write, as the user of this process;
-- 1 GiB of memory with no swap, 256 processes and 4 CPUs;
+- 1 GiB of memory with no swap, 256 processes and 4 CPUs (AGENT_EVAL_MEMORY and AGENT_EVAL_CPUS change them);
+- no capabilities (``--cap-drop ALL``) and no new privileges;
 - ``timeout`` in the container, and ``docker kill`` from the host when the container does not stop.
 
 At most ``SLOTS`` commands run at the same time on this machine, in all processes together (a file lock for each
@@ -22,6 +23,8 @@ import uuid
 
 IMAGE = os.environ.get("AGENT_EVAL_IMAGE", "agent-eval-sandbox:1")
 SLOTS = int(os.environ.get("AGENT_EVAL_SLOTS", "2"))
+MEMORY = os.environ.get("AGENT_EVAL_MEMORY", "1g")
+CPUS = os.environ.get("AGENT_EVAL_CPUS", "4")
 LOCKS = os.environ.get("AGENT_EVAL_LOCKS", os.path.join(tempfile.gettempdir(), "agent-eval-slots"))
 MAX_OUT = 10_000   # characters of output that a tool result keeps: the head and the tail
 
@@ -55,10 +58,11 @@ def clip(text: str, limit: int = MAX_OUT) -> str:
     return f"{text[:half]}\n[... {len(text) - limit} characters left out ...]\n{text[-half:]}"
 
 
-def docker_cmd(workdir: str, command: str, timeout: int, name: str, memory: str = "1g") -> list[str]:
+def docker_cmd(workdir: str, command: str, timeout: int, name: str) -> list[str]:
     return ["docker", "run", "--rm", "--name", name, "--network", "none", "--read-only",
-            "--tmpfs", "/tmp:rw,exec,size=1g", "--memory", memory, "--memory-swap", memory,
-            "--pids-limit", "256", "--cpus", "4", "--user", f"{os.getuid()}:{os.getgid()}",
+            "--tmpfs", "/tmp:rw,exec,size=1g", "--memory", MEMORY, "--memory-swap", MEMORY,
+            "--pids-limit", "256", "--cpus", CPUS, "--user", f"{os.getuid()}:{os.getgid()}",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "-v", f"{os.path.abspath(workdir)}:/work", "-w", "/work", IMAGE,
             "timeout", "-k", "5", str(timeout), "bash", "-c", command]
 

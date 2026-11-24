@@ -3,16 +3,17 @@
   python3 agent_report.py Q4                 # the table of a point, per model and per family
   python3 agent_report.py Q4 --ref Q1        # and the difference to a reference point, with the gates G1 to G4
   python3 agent_report.py --show results/agent-eval/Q4/qwen-L1-s0   # one transcript, for the manual read
+  python3 agent_report.py Q4 --json --block-size 2176   # the JSON report, with the best cache hits for that block size
 
-The difference of two points uses only the tasks that both have. It averages the seeds of each task first, then it
-takes a 95% interval from a bootstrap over the tasks (2000 samples, a fixed seed).
+A rate averages the seeds of each task first, then it takes a 95% interval from a bootstrap over the tasks (2000
+samples, a fixed seed). The difference of two points uses only the tasks that both have.
 """
 
 import argparse
 import json
 import random
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import agent_eval as ae
@@ -51,16 +52,55 @@ def per_task(rows: list[dict], result: str) -> dict[str, float]:
     return {t: sum(v) / len(v) for t, v in by.items()}
 
 
+def bootstrap(values: list[float], samples=2000) -> tuple[float, float, float]:
+    """The mean of the values and its 95% interval from a bootstrap with a fixed seed."""
+    if not values:
+        return float("nan"), float("nan"), float("nan")
+    rng = random.Random(0)
+    boot = sorted(statistics.fmean(rng.choices(values, k=len(values))) for _ in range(samples))
+    return statistics.fmean(values), boot[int(0.025 * samples)], boot[int(0.975 * samples)]
+
+
 def diff(new: list[dict], ref: list[dict], result: str, samples=2000) -> tuple[float, float, float]:
     """The difference in points of the rate of `result`, new minus ref, on the common tasks, and its 95% interval."""
     a, b = per_task(new, result), per_task(ref, result)
-    tasks = sorted(a.keys() & b.keys())
-    if not tasks:
-        return float("nan"), float("nan"), float("nan")
-    d = [100 * (a[t] - b[t]) for t in tasks]
-    rng = random.Random(0)
-    boot = sorted(statistics.fmean(rng.choices(d, k=len(d))) for _ in range(samples))
-    return statistics.fmean(d), boot[int(0.025 * samples)], boot[int(0.975 * samples)]
+    return bootstrap([100 * (a[t] - b[t]) for t in sorted(a.keys() & b.keys())], samples)
+
+
+def best_hits(run_dirs: list[Path], block: int) -> dict:
+    """The prompt tokens of all turns, and the most prefix-cache hits that a server with blocks of `block` tokens can
+    give inside each run: on each turn, the prompt of the turn before, rounded down to full blocks."""
+    prompt = best = 0
+    for d in run_dirs:
+        if (d / "transcript.json").exists():
+            pts = [t["usage"].get("prompt_tokens") or 0 for t in json.loads((d / "transcript.json").read_text())["turns"]]
+            prompt, best = prompt + sum(pts), best + sum(p // block * block for p in pts[:-1])
+    return {"block_size": block, "prompt_tokens": prompt, "best_hits": best, "best_rate": round(pct(best, prompt), 1) if prompt else None}
+
+
+def report(name: str, block: int | None = None) -> dict:
+    """The JSON report of a point: for each model, task set and family, the rates with their intervals, the stops, the
+    median seconds and output tokens. With `block`, also the best cache hits of each model."""
+    rows, meta_f, groups = rows_of(name), ae.OUT / name / "point.json", []
+    for model in sorted({x["model"] for x in rows}):
+        mrows = [x for x in rows if x["model"] == model]
+        for st in ["all"] + sorted({x.get("set", "dev") for x in mrows}):
+            srows = [x for x in mrows if st in ("all", x.get("set", "dev"))]
+            for fam in ["all"] + sorted({x["family"] for x in srows}):
+                g = [x for x in srows if fam in ("all", x["family"])]
+                rates = {r: dict(zip(("rate", "lo", "hi"), (round(v, 1) for v in
+                                                           bootstrap([100 * p for p in per_task(g, r).values()]))))
+                         for r in RESULTS}
+                groups.append({"model": model, "set": st, "family": fam, "runs": len(g),
+                               "tasks": len({x["task"] for x in g}), **rates, "events": summary(g)["events"],
+                               "stops": dict(Counter(x.get("stop") for x in g)),
+                               "median_s": statistics.median(x["seconds"] for x in g),
+                               "median_completion_tokens": statistics.median(x.get("completion_tokens", 0) for x in g)})
+    out = {"point": name, "meta": json.loads(meta_f.read_text()) if meta_f.exists() else {}, "groups": groups}
+    if block:
+        out["cache"] = {m: best_hits([ae.OUT / name / f"{m}-{x['task']}-s{x['seed']}" for x in rows if x["model"] == m],
+                                     block) for m in sorted({x["model"] for x in rows})}
+    return out
 
 
 def watch_stops(t0: float, t1: float) -> int:
@@ -137,8 +177,13 @@ def main():
     ap.add_argument("point", nargs="?")
     ap.add_argument("--ref")
     ap.add_argument("--show", type=Path)
+    ap.add_argument("--json", action="store_true", help="the JSON report of the point instead of the table")
+    ap.add_argument("--block-size", type=int, help="with --json: the block size of the prefix cache of the server")
     a = ap.parse_args()
-    print(show(a.show) if a.show else table(a.point, a.ref))
+    if a.show:
+        print(show(a.show))
+    else:
+        print(json.dumps(report(a.point, a.block_size), indent=1) if a.json else table(a.point, a.ref))
 
 
 if __name__ == "__main__":
